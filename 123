@@ -1,24 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ====== CONFIG (можешь менять под себя) ======
 ALLOW_TCP_PORTS=("22" "443" "9443")
 
-# rate-limit SYN на 443 (per-IP)
 SYN_PER_IP_RATE="30/second"
 SYN_PER_IP_BURST="60"
-
-# глобальный предохранитель SYN на 443
 SYN_GLOBAL_RATE="5000/second"
 SYN_GLOBAL_BURST="10000"
-
-# если UDP на 443 тебе не нужен (обычно для VLESS+Reality не нужен) -> 1
 DROP_UDP_443="1"
 
-# автоприбить сервисы, которые слушают лишнее (опционально)
 STOP_CADDY="0"
 STOP_ZABBIX="0"
-# ============================================
+
+ENABLE_FAIL2BAN="1"
+FAIL2BAN_BANTIME="1h"
+FAIL2BAN_FINDTIME="10m"
+FAIL2BAN_MAXRETRY="5"
+FAIL2BAN_ENABLE_SSHD="1"
+FAIL2BAN_ENABLE_RECIDIVE="1"
+FAIL2BAN_IGNOREIP="127.0.0.1/8 ::1"
 
 require_root() {
   if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
@@ -29,10 +29,15 @@ require_root() {
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
+install_pkg_apt() {
+  local pkg="$1"
+  apt-get update -y
+  apt-get install -y "$pkg"
+}
+
 disable_ufw_if_active() {
   if have_cmd ufw; then
     if ufw status 2>/dev/null | grep -qi "Status: active"; then
-      echo "[*] ufw active -> disabling"
       ufw disable || true
     fi
   fi
@@ -42,13 +47,25 @@ install_nftables() {
   if have_cmd nft; then
     return 0
   fi
-
   if have_cmd apt-get; then
-    echo "[*] installing nftables"
-    apt-get update -y
-    apt-get install -y nftables
+    install_pkg_apt nftables
   else
     echo "apt-get not found; install nftables manually"
+    exit 1
+  fi
+}
+
+install_fail2ban() {
+  if [[ "${ENABLE_FAIL2BAN}" != "1" ]]; then
+    return 0
+  fi
+  if have_cmd fail2ban-client; then
+    return 0
+  fi
+  if have_cmd apt-get; then
+    install_pkg_apt fail2ban
+  else
+    echo "apt-get not found; install fail2ban manually"
     exit 1
   fi
 }
@@ -57,19 +74,16 @@ backup_rules() {
   mkdir -p /root
   local ts
   ts="$(date +%F_%H%M%S)"
-  echo "[*] backup current ruleset -> /root/nft.ruleset.bak.${ts}.txt"
   nft list ruleset > "/root/nft.ruleset.bak.${ts}.txt" || true
-
   if [[ -f /etc/nftables.conf ]]; then
-    echo "[*] backup /etc/nftables.conf -> /root/nftables.conf.bak.${ts}"
     cp -a /etc/nftables.conf "/root/nftables.conf.bak.${ts}"
   fi
 }
 
-write_config() {
-  local ports_line=""
+write_nft_config() {
+  local ports_lines=""
   for port in "${ALLOW_TCP_PORTS[@]}"; do
-    ports_line+=$'    tcp dport '"${port}"$' accept\n'
+    ports_lines+=$'    tcp dport '"${port}"$' accept\n'
   done
 
   local udp443_rule=""
@@ -82,7 +96,7 @@ flush ruleset
 
 table inet ddos {
   chain pre {
-    type filter hook prerouting priority -300; policy accept;
+    type filter hook prerouting priority raw; policy accept;
 
 ${udp443_rule}    tcp dport 443 tcp flags syn counter meter syn443v4 { ip saddr limit rate over ${SYN_PER_IP_RATE} burst ${SYN_PER_IP_BURST} packets } drop
     tcp dport 443 tcp flags syn counter meter syn443v6 { ip6 saddr limit rate over ${SYN_PER_IP_RATE} burst ${SYN_PER_IP_BURST} packets } drop
@@ -100,9 +114,9 @@ table inet filter {
     ct state established,related accept
 
     ip protocol icmp accept
-    ip6 nexthdr icmpv6 accept
+    ip6 nexthdr ipv6-icmp accept
 
-${ports_line}  }
+${ports_lines}  }
 
   chain forward {
     type filter hook forward priority 0; policy drop;
@@ -120,26 +134,87 @@ ${ports_line}  }
 EOF
 }
 
-apply_rules() {
-  echo "[*] enabling nftables service"
+apply_nft() {
   systemctl enable --now nftables >/dev/null 2>&1 || true
-
-  echo "[*] applying rules from /etc/nftables.conf"
   nft -f /etc/nftables.conf
-
   systemctl restart nftables >/dev/null 2>&1 || true
 }
 
 optional_stop_services() {
   if [[ "${STOP_CADDY}" == "1" ]]; then
-    echo "[*] stopping caddy"
     systemctl disable --now caddy 2>/dev/null || true
   fi
-
   if [[ "${STOP_ZABBIX}" == "1" ]]; then
-    echo "[*] stopping zabbix-agent"
     systemctl disable --now zabbix-agent zabbix-agent2 2>/dev/null || true
   fi
+}
+
+pick_fail2ban_action() {
+  local action="iptables-multiport"
+  if [[ -f /etc/fail2ban/action.d/nftables-multiport.conf ]]; then
+    action="nftables-multiport"
+  elif [[ -f /etc/fail2ban/action.d/nftables.conf ]]; then
+    action="nftables"
+  elif [[ -f /etc/fail2ban/action.d/iptables-multiport.conf ]]; then
+    action="iptables-multiport"
+  elif [[ -f /etc/fail2ban/action.d/iptables-allports.conf ]]; then
+    action="iptables-allports"
+  fi
+  echo "$action"
+}
+
+pick_fail2ban_allports_action() {
+  local action="iptables-allports"
+  if [[ -f /etc/fail2ban/action.d/nftables-allports.conf ]]; then
+    action="nftables-allports"
+  elif [[ -f /etc/fail2ban/action.d/nftables.conf ]]; then
+    action="nftables"
+  elif [[ -f /etc/fail2ban/action.d/iptables-allports.conf ]]; then
+    action="iptables-allports"
+  fi
+  echo "$action"
+}
+
+configure_fail2ban() {
+  if [[ "${ENABLE_FAIL2BAN}" != "1" ]]; then
+    return 0
+  fi
+
+  local banaction
+  banaction="$(pick_fail2ban_action)"
+  local banaction_allports
+  banaction_allports="$(pick_fail2ban_allports_action)"
+
+  mkdir -p /etc/fail2ban/jail.d
+
+  cat > /etc/fail2ban/jail.d/00-antidd.conf <<EOF
+[DEFAULT]
+ignoreip = ${FAIL2BAN_IGNOREIP}
+bantime = ${FAIL2BAN_BANTIME}
+findtime = ${FAIL2BAN_FINDTIME}
+maxretry = ${FAIL2BAN_MAXRETRY}
+banaction = ${banaction}
+
+[sshd]
+enabled = $( [[ "${FAIL2BAN_ENABLE_SSHD}" == "1" ]] && echo "true" || echo "false" )
+port = 22
+mode = aggressive
+backend = systemd
+journalmatch = _SYSTEMD_UNIT=ssh.service + _SYSTEMD_UNIT=sshd.service
+
+[recidive]
+enabled = $( [[ "${FAIL2BAN_ENABLE_RECIDIVE}" == "1" ]] && echo "true" || echo "false" )
+backend = auto
+filter = recidive
+logpath = /var/log/fail2ban.log
+banaction = ${banaction_allports}
+bantime = 1d
+findtime = 1d
+maxretry = 5
+EOF
+
+  systemctl enable --now fail2ban >/dev/null 2>&1 || true
+  systemctl restart fail2ban >/dev/null 2>&1 || true
 }
 
 show_status() {
@@ -155,6 +230,12 @@ show_status() {
   echo "[*] listening ports (non-localhost):"
   ss -lntup | awk 'NR==1 || $4 !~ /(127\.0\.0\.1|::1)/' || true
 
+  if [[ "${ENABLE_FAIL2BAN}" == "1" ]] && have_cmd fail2ban-client; then
+    echo
+    echo "[*] fail2ban status:"
+    fail2ban-client status || true
+  fi
+
   echo
   echo "[*] done"
   echo "rollback: nft -f /root/nft.ruleset.bak.<TIMESTAMP>.txt"
@@ -164,10 +245,12 @@ main() {
   require_root
   disable_ufw_if_active
   install_nftables
+  install_fail2ban
   backup_rules
-  write_config
-  apply_rules
+  write_nft_config
+  apply_nft
   optional_stop_services
+  configure_fail2ban
   show_status
 }
 
