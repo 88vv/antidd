@@ -133,6 +133,10 @@ pick_fail2ban_action() {
     echo "nftables-multiport"
     return
   fi
+  if [[ -f /etc/fail2ban/action.d/nftables.conf ]]; then
+    echo "nftables"
+    return
+  fi
   if [[ -f /etc/fail2ban/action.d/iptables-multiport.conf ]]; then
     echo "iptables-multiport"
     return
@@ -140,17 +144,21 @@ pick_fail2ban_action() {
   echo "iptables-multiport"
 }
 
-configure_fail2ban() {
-  if [[ "${ENABLE_FAIL2BAN}" != "1" ]]; then
-    return 0
-  fi
+write_fail2ban_conf() {
+  local banaction
+  banaction="$(pick_fail2ban_action)"
 
   mkdir -p /etc/fail2ban/jail.d
   mkdir -p /run/fail2ban
   touch /var/log/fail2ban.log || true
+  chmod 0644 /var/log/fail2ban.log || true
 
-  local banaction
-  banaction="$(pick_fail2ban_action)"
+  cat > /etc/fail2ban/fail2ban.local <<'EOF'
+[Definition]
+logtarget = /var/log/fail2ban.log
+socket = /run/fail2ban/fail2ban.sock
+pidfile = /run/fail2ban/fail2ban.pid
+EOF
 
   cat > /etc/fail2ban/jail.d/00-antidd.conf <<EOF
 [DEFAULT]
@@ -164,11 +172,39 @@ banaction = ${banaction}
 enabled = true
 port = 22
 mode = aggressive
-backend = systemd
 EOF
+}
 
-  systemctl enable --now fail2ban >/dev/null 2>&1 || true
+start_fail2ban() {
+  if [[ "${ENABLE_FAIL2BAN}" != "1" ]]; then
+    return 0
+  fi
+
+  rm -f /run/fail2ban/fail2ban.sock /run/fail2ban/fail2ban.pid 2>/dev/null || true
+  mkdir -p /run/fail2ban
+  chmod 0755 /run/fail2ban || true
+
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl reset-failed fail2ban >/dev/null 2>&1 || true
+
+  systemctl enable fail2ban >/dev/null 2>&1 || true
   systemctl restart fail2ban >/dev/null 2>&1 || true
+
+  local ok="0"
+  for _ in $(seq 1 40); do
+    if [[ -S /run/fail2ban/fail2ban.sock || -S /var/run/fail2ban/fail2ban.sock ]]; then
+      ok="1"
+      break
+    fi
+    sleep 0.25
+  done
+
+  if [[ "${ok}" != "1" ]]; then
+    echo "[*] fail2ban socket not found, showing diagnostics"
+    systemctl status fail2ban --no-pager -l || true
+    journalctl -u fail2ban -n 200 --no-pager || true
+    return 0
+  fi
 
   set +e
   fail2ban-client ping >/dev/null 2>&1
@@ -176,7 +212,7 @@ EOF
   set -e
 
   if [[ "${ping_status}" -ne 0 ]]; then
-    echo "[*] fail2ban failed to start; showing diagnostics"
+    echo "[*] fail2ban socket exists but client ping failed, diagnostics:"
     systemctl status fail2ban --no-pager -l || true
     journalctl -u fail2ban -n 200 --no-pager || true
     return 0
@@ -214,7 +250,12 @@ main() {
   backup_rules
   write_nft_config
   apply_nft
-  configure_fail2ban
+
+  if [[ "${ENABLE_FAIL2BAN}" == "1" ]]; then
+    write_fail2ban_conf
+    start_fail2ban
+  fi
+
   show_status
 }
 
